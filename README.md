@@ -1,4 +1,4 @@
-# BAT: a small, reusable encryption toolkit
+# BAT: a reusable encryption toolkit
 
 BAT turns data into unreadable bytes that only the right password (or key) can turn back.
 It works fully offline, supports any data (text, files, photos, video, database fields...), and
