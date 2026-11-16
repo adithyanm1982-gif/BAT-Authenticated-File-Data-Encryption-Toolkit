@@ -1,6 +1,10 @@
 """BAT high-level API: encrypt/decrypt bytes, streams and files with a password or a 32-byte key."""
 import os
 import struct
+import tempfile
+import shutil
+import ctypes
+from ctypes import wintypes
 
 from .core import (AuthError, OVERHEAD, check_kdf_params, hkdf, kdf_argon2,
                    normalize_password, open_, rand, seal)
@@ -12,6 +16,37 @@ MAX_CHUNK = 16 << 20
 _BLOB_MAGIC, _FILE_MAGIC = b"BAT1", b"BATF"
 _BLOB_HDR = 4 + 1 + 9 + 16            # magic|mode|m,t,p|salt
 _FILE_HDR = _BLOB_HDR + 16 + 4        # ...|file_id|chunk_size
+
+
+def _secure_create(path):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    if os.name == "nt":
+        try:
+            sddl = ctypes.c_void_p()
+            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+            convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+            convert.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.ULONG)]
+            convert.restype = wintypes.BOOL
+            if not convert("D:P(A;;FA;;;OW)", 1, ctypes.byref(sddl), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                set_info = advapi32.SetNamedSecurityInfoW
+                set_info.argtypes = [wintypes.LPWSTR, wintypes.DWORD,
+                                     wintypes.DWORD, wintypes.LPVOID,
+                                     wintypes.LPVOID, wintypes.LPVOID,
+                                     wintypes.LPVOID]
+                set_info.restype = wintypes.DWORD
+                result = set_info(path, 1, 0x00000004, None, None, sddl, None)
+                if result:
+                    raise ctypes.WinError(result)
+            finally:
+                ctypes.windll.kernel32.LocalFree(sddl)
+        except Exception:
+            os.close(fd)
+            os.remove(path)
+            raise
+    return os.fdopen(fd, "wb")
 
 
 class DecryptionError(Exception):
@@ -118,8 +153,7 @@ def encrypt_stream(src, dst, secret, *, context=b"", chunk_size=1 << 20, kdf=DEF
 
 
 def decrypt_stream(src, dst, secret, *, context=b""):
-    """NOTE: chunks are written as each one verifies; truncation is only known at the end.
-    Use decrypt_file() (writes a temp file, renames on success) when that matters."""
+    """Decrypt a stream and publish plaintext only after every chunk verifies."""
     hdr = _read_full(src, _FILE_HDR)
     if len(hdr) < _FILE_HDR:
         raise FormatError("truncated header")
@@ -132,19 +166,22 @@ def decrypt_stream(src, dst, secret, *, context=b""):
     fsz = chunk_size + OVERHEAD
     cur = _read_full(src, fsz)
     idx = 0
-    while True:
-        nxt = _read_full(src, fsz)
-        final = not nxt
-        if not final and len(cur) != fsz:
-            raise FormatError("malformed chunk")
-        try:
-            pt = open_(key, cur, hdr + context + struct.pack("<QB", idx, 1 if final else 0))
-        except AuthError:
-            raise DecryptionError("wrong password/key, wrong context, or data was modified/truncated")
-        dst.write(pt)
-        if final:
-            return
-        cur, idx = nxt, idx + 1
+    with tempfile.SpooledTemporaryFile(max_size=8 << 20, mode="w+b") as plaintext:
+        while True:
+            nxt = _read_full(src, fsz)
+            final = not nxt
+            if not final and len(cur) != fsz:
+                raise FormatError("malformed chunk")
+            try:
+                pt = open_(key, cur, hdr + context + struct.pack("<QB", idx, 1 if final else 0))
+            except AuthError:
+                raise DecryptionError("wrong password/key, wrong context, or data was modified/truncated")
+            plaintext.write(pt)
+            if final:
+                plaintext.seek(0)
+                shutil.copyfileobj(plaintext, dst)
+                return
+            cur, idx = nxt, idx + 1
 
 
 def encrypt_file(path_in, path_out, secret, **kw):
@@ -162,7 +199,7 @@ def encrypt_file(path_in, path_out, secret, **kw):
 def decrypt_file(path_in, path_out, secret, **kw):
     tmp = path_out + ".tmp"
     try:
-        with open(path_in, "rb") as s, open(tmp, "xb") as d:
+        with open(path_in, "rb") as s, _secure_create(tmp) as d:
             decrypt_stream(s, d, secret, **kw)
             d.flush(); os.fsync(d.fileno())
         os.replace(tmp, path_out)         # only appears if EVERYTHING verified

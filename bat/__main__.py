@@ -2,6 +2,7 @@
 import argparse, getpass, os, sys
 from . import (encrypt_file, decrypt_file, generate_key, DecryptionError, FormatError,
                DEFAULT_KDF, FAST_KDF)
+from .api import _secure_create
 
 
 def _secret(a, confirm=False):
@@ -31,9 +32,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     try:
         if a.cmd == "keygen":
-            with open(a.file, "xb") as f:
+            with _secure_create(a.file) as f:
                 f.write(generate_key())
-            os.chmod(a.file, 0o600)
             print("wrote 32-byte key:", a.file, "(back it up; losing it loses your data)")
         elif a.cmd == "encrypt":
             encrypt_file(a.input, a.output, _secret(a, True), kdf=FAST_KDF if a.fast else DEFAULT_KDF)

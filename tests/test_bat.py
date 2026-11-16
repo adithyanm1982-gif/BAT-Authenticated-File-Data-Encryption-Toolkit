@@ -42,14 +42,18 @@ class T(unittest.TestCase):
         k = generate_key()
         e = io.BytesIO(); encrypt_stream(io.BytesIO(os.urandom(3500)), e, k, chunk_size=1000, context=b"c")
         blob, fsz, hs = e.getvalue(), 1000 + 40, 50
-        def dec(b, ctx=b"c"): decrypt_stream(io.BytesIO(b), io.BytesIO(), k, context=ctx)
-        dec(blob)
-        with self.assertRaises(DecryptionError): dec(blob[:hs + 2 * fsz])            # cut at chunk boundary
-        with self.assertRaises(DecryptionError): dec(blob[:-5])                      # cut mid-chunk
+        def dec(b, ctx=b"c"):
+            output = io.BytesIO()
+            with self.assertRaises(DecryptionError):
+                decrypt_stream(io.BytesIO(b), output, k, context=ctx)
+            self.assertEqual(output.getvalue(), b"")
+        decrypt_stream(io.BytesIO(blob), io.BytesIO(), k, context=b"c")
+        dec(blob[:hs + 2 * fsz])            # cut at chunk boundary
+        dec(blob[:-5])                      # cut mid-chunk
         c = [blob[hs + i * fsz: hs + (i + 1) * fsz] for i in range(3)]
         swapped = blob[:hs] + c[1] + c[0] + c[2] + blob[hs + 3 * fsz:]
-        with self.assertRaises(DecryptionError): dec(swapped)                        # reorder
-        with self.assertRaises(DecryptionError): dec(blob, b"x")                     # wrong context
+        dec(swapped)                        # reorder
+        dec(blob, b"x")                     # wrong context
 
     def test_files_atomic(self):
         d = tempfile.mkdtemp()
